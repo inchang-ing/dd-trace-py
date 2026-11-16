@@ -134,7 +134,7 @@ experiments:
           # packagespackageforrootmodulemapping
           - name: packagespackageforrootmodulemapping-cache_off
             thresholds:
-              - execution_time < 1300.00 ms
+              - execution_time < 60.00 ms
           - name: packagespackageforrootmodulemapping-cache_on
             thresholds:
               - execution_time < 0.01 ms
@@ -274,6 +274,9 @@ experiments:
             thresholds:
               - execution_time < 10000 ms
           - name: startup-ddtrace_run_appsec
+            thresholds:
+              - execution_time < 10000 ms
+          - name: startup-ddtrace_run_llmobs
             thresholds:
               - execution_time < 10000 ms
           - name: startup-ddtrace_run_profiling

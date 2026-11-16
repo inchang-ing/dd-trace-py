@@ -3,8 +3,7 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
-import pytest
-from anthropic.types import CacheCreation
+import anthropic as anthropic_module
 from anthropic.types import Message
 from anthropic.types import MessageDeltaUsage
 from anthropic.types import RawMessageDeltaEvent
@@ -12,15 +11,30 @@ from anthropic.types import RawMessageStartEvent
 from anthropic.types import TextBlock
 from anthropic.types import Usage
 from anthropic.types.raw_message_delta_event import Delta
+import httpx
+import pytest
 
+from ddtrace.contrib.internal.anthropic.patch import patch as patch_anthropic
+from ddtrace.contrib.internal.anthropic.patch import unpatch as unpatch_anthropic
+from ddtrace.ext import SpanTypes
+from ddtrace.internal import core
 from ddtrace.internal.evp_proxy.constants import DEFAULT_EVP_EVENT_SIZE_LIMIT
+from ddtrace.llmobs import LLMObs
+from ddtrace.llmobs import _product
+from ddtrace.llmobs._constants import LLMOBS_APM_SHADOW_ENABLED_METRIC_KEY
+from ddtrace.llmobs._constants import LLMOBS_APM_SHADOW_INPUT_TOKENS_METRIC_KEY
 from ddtrace.llmobs._constants import REQUEST_BASE_URL
+from ddtrace.llmobs._constants import SUPPORTED_LLMOBS_INTEGRATIONS
 from ddtrace.llmobs._integrations.anthropic import _extract_anthropic_image_source
 from ddtrace.llmobs._integrations.utils import LLMOBS_IMAGE_INLINE_MAX_BYTES
+from ddtrace.llmobs._llmobs import _INTEGRATIONS_W_PROPAGATION_SUPPORT
+from ddtrace.llmobs._subscribers import LLMObsLlmSubscriber
+from ddtrace.llmobs._subscribers import integration_for
 from ddtrace.llmobs._utils import _get_llmobs_data_metastruct
 from ddtrace.llmobs._utils import get_llmobs_model_provider
 from ddtrace.llmobs._utils import get_llmobs_span_kind
 from ddtrace.llmobs._utils import safe_json
+from ddtrace.trace import Span
 from tests.contrib.anthropic.test_anthropic import ANTHROPIC_VERSION
 from tests.contrib.anthropic.test_anthropic import BETA_SKIP_REASON
 from tests.contrib.anthropic.utils import MOCK_MESSAGES_CREATE_REQUEST
@@ -31,9 +45,12 @@ from tests.llmobs._utils import anext_stream
 from tests.llmobs._utils import assert_llmobs_span_data
 from tests.llmobs._utils import iterate_stream
 from tests.llmobs._utils import next_stream
+from tests.utils import override_global_config
 
 
 WEATHER_PROMPT = "What is the weather in San Francisco, CA?"
+WEB_SEARCH_PROMPT = "Use web search to find the latest released version of the Python package requests on PyPI."
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
 WEATHER_OUTPUT_MESSAGE_1 = '<thinking>\nThe get_weather tool is directly relevant for answering this \
 question about the weather in a specific location. \n\nThe get_weather tool requires a "location" \
 parameter. The user has provided the location of "San Francisco, CA" in their question, so we have \
@@ -430,6 +447,40 @@ class TestLLMObsAnthropic:
         spans = [s for trace in test_spans.pop_traces() for s in trace]
         assert len(spans) == 1
         assert get_llmobs_model_provider(spans[0]) == "google"
+
+    def test_completion_web_search(self, anthropic, anthropic_llmobs, test_spans, request_vcr):
+        """web_search_count is read from usage.server_tool_use.web_search_requests."""
+        llm = anthropic.Anthropic()
+        with request_vcr.use_cassette("anthropic_completion_web_search.yaml"):
+            llm.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": WEB_SEARCH_PROMPT}],
+                tools=[WEB_SEARCH_TOOL],
+            )
+        spans = [s for trace in test_spans.pop_traces() for s in trace]
+        assert len(spans) == 1
+        metrics = _get_llmobs_data_metastruct(spans[0])["metrics"]
+        assert metrics["web_search_count"] == 1
+        # Web fetch has no per-call price, so it is not recorded.
+        assert not any("fetch" in key for key in metrics)
+
+    @pytest.mark.parametrize("consume_stream", [iterate_stream, next_stream])
+    def test_completion_web_search_stream(self, anthropic, anthropic_llmobs, test_spans, request_vcr, consume_stream):
+        """Streamed usage keeps server_tool_use from the final message_delta event."""
+        llm = anthropic.Anthropic()
+        with request_vcr.use_cassette("anthropic_completion_web_search_stream.yaml"):
+            stream = llm.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": WEB_SEARCH_PROMPT}],
+                tools=[WEB_SEARCH_TOOL],
+                stream=True,
+            )
+            consume_stream(stream)
+        spans = [s for trace in test_spans.pop_traces() for s in trace]
+        assert len(spans) == 1
+        assert _get_llmobs_data_metastruct(spans[0])["metrics"]["web_search_count"] == 1
 
     def test_completion(self, anthropic, anthropic_llmobs, test_spans, request_vcr):
         """Ensure llmobs records are emitted for completion endpoints when configured.
@@ -2011,6 +2062,7 @@ def test_shadow_tags_chat_when_llmobs_disabled(tracer):
     response.usage.output_tokens = 8
     response.usage.cache_creation_input_tokens = None
     response.usage.cache_read_input_tokens = None
+    response.usage.server_tool_use = None
 
     with tracer.trace("anthropic.request") as span:
         span._set_ctx_item(REQUEST_BASE_URL, "https://api.anthropic.com")
@@ -2038,6 +2090,7 @@ def test_shadow_tags_chat_with_cache_tokens(tracer):
     response.usage.output_tokens = 8
     response.usage.cache_creation_input_tokens = 5
     response.usage.cache_read_input_tokens = 3
+    response.usage.server_tool_use = None
 
     with tracer.trace("anthropic.request") as span:
         span._set_ctx_item(REQUEST_BASE_URL, "https://api.anthropic.com")
@@ -2097,17 +2150,15 @@ def test_get_model_provider_is_per_span(tracer):
 @pytest.mark.parametrize(
     "cache_creation,expected_1h,expected_5m",
     [
-        (CacheCreation(ephemeral_1h_input_tokens=3000, ephemeral_5m_input_tokens=0), 3000, 0),
-        (CacheCreation(ephemeral_1h_input_tokens=0, ephemeral_5m_input_tokens=3000), 0, 3000),
-        (CacheCreation(ephemeral_1h_input_tokens=1000, ephemeral_5m_input_tokens=2000), 1000, 2000),
+        ({"ephemeral_1h_input_tokens": 3000, "ephemeral_5m_input_tokens": 0}, 3000, 0),
+        ({"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 3000}, 0, 3000),
+        ({"ephemeral_1h_input_tokens": 1000, "ephemeral_5m_input_tokens": 2000}, 1000, 2000),
+        (None, 0, 3000),
     ],
 )
-def test_streamed_cache_creation_ttl_breakdown(cache_creation, expected_1h, expected_5m):
-    """A streamed cache write is reported with the TTL class that the API reported.
-
-    ``message_start`` carries the split in ``usage.cache_creation``, so the stream builder must keep it.
-    Otherwise every write falls back to the default 5m TTL and 1h writes are under-reported.
-    """
+@pytest.mark.parametrize("delta_has_input_usage", [False, True])
+def test_streamed_cache_creation_ttl_breakdown(cache_creation, expected_1h, expected_5m, delta_has_input_usage):
+    """Preserve the reported TTL split when final output usage is merged into message_start."""
     from unittest.mock import MagicMock
 
     from ddtrace.contrib.internal.anthropic._streaming import _construct_message
@@ -2117,7 +2168,7 @@ def test_streamed_cache_creation_ttl_breakdown(cache_creation, expected_1h, expe
         input_tokens=12,
         output_tokens=0,
         cache_creation_input_tokens=3000,
-        cache_read_input_tokens=0,
+        cache_read_input_tokens=7,
         cache_creation=cache_creation,
     )
     message = Message(
@@ -2130,6 +2181,9 @@ def test_streamed_cache_creation_ttl_breakdown(cache_creation, expected_1h, expe
         stop_sequence=None,
         usage=usage,
     )
+    delta_usage = {"output_tokens": 5}
+    if delta_has_input_usage:
+        delta_usage.update(input_tokens=13, cache_creation_input_tokens=3000, cache_read_input_tokens=8)
     chunks = [
         RawMessageStartEvent(
             type="message_start",
@@ -2138,20 +2192,169 @@ def test_streamed_cache_creation_ttl_breakdown(cache_creation, expected_1h, expe
         RawMessageDeltaEvent(
             type="message_delta",
             delta=Delta(stop_reason="end_turn", stop_sequence=None),
-            usage=MessageDeltaUsage(
-                output_tokens=5,
-                input_tokens=12,
-                cache_creation_input_tokens=3000,
-                cache_read_input_tokens=0,
-            ),
+            usage=MessageDeltaUsage(**delta_usage),
         ),
     ]
 
     integration = AnthropicIntegration(MagicMock())
     streamed_metrics = integration._extract_usage(None, _construct_message(chunks)["usage"])
-    non_streamed_metrics = integration._extract_usage(None, usage.model_copy(update={"output_tokens": 5}))
+    non_streamed_metrics = integration._extract_usage(None, usage.model_copy(update=delta_usage))
 
     assert streamed_metrics == non_streamed_metrics
     assert streamed_metrics["cache_write_input_tokens"] == 3000
+    assert streamed_metrics["input_tokens"] == (3021 if delta_has_input_usage else 3019)
+    assert streamed_metrics["output_tokens"] == 5
     assert streamed_metrics["ephemeral_1h_input_tokens"] == expected_1h
     assert streamed_metrics["ephemeral_5m_input_tokens"] == expected_5m
+
+
+@pytest.fixture
+def subscriber_lifecycle(tracer):
+    LLMObs.disable()
+    unpatch_anthropic()
+    with (
+        override_global_config({"_llmobs_ml_app": "subscriber-tests", "_dd_api_key": "not-a-real-key"}),
+        patch("ddtrace.llmobs._llmobs.LLMObsSpanWriter"),
+        patch("ddtrace.llmobs._llmobs.LLMObsEvalMetricWriter"),
+        patch("ddtrace.llmobs._llmobs.EvaluatorRunner"),
+    ):
+        try:
+
+            def enable():
+                LLMObs.enable(_tracer=tracer, integrations_enabled=False, agentless_enabled=False)
+                tracer._span_aggregator.llmobs_processor._keep_meta_struct = True
+
+            yield enable
+        finally:
+            unpatch_anthropic()
+            LLMObs.disable()
+
+
+@pytest.mark.parametrize("patch_before_enable", [True, False])
+def test_subscriber_real_patch_enable_lifecycle(subscriber_lifecycle, test_spans, patch_before_enable):
+    def respond(request):
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg-test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-opus-20240229",
+                "content": [{"type": "text", "text": "Hello"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+        )
+
+    def request(enabled):
+        # Observe actual writes while preserving the real span and extraction methods.
+        writes = []
+        set_attribute = Span._set_attribute
+
+        def record_attribute(span, key, value):
+            writes.append(key)
+            return set_attribute(span, key, value)
+
+        integration = integration_for("anthropic")
+        with (
+            patch.object(Span, "_set_attribute", record_attribute),
+            patch.object(integration, "_set_base_span_tags", wraps=integration._set_base_span_tags) as base_tags,
+            patch.object(integration, "llmobs_set_tags", wraps=integration.llmobs_set_tags) as response_tags,
+        ):
+            client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+        spans = [span for trace in test_spans.pop_traces() for span in trace]
+        assert len(spans) == 1
+        span = spans[0]
+        assert span.span_type == (SpanTypes.LLM if enabled else None)
+        assert span.get_metric(LLMOBS_APM_SHADOW_ENABLED_METRIC_KEY) == int(enabled)
+        assert span.get_metric(LLMOBS_APM_SHADOW_INPUT_TOKENS_METRIC_KEY) == 5
+        base_tags.assert_called_once()
+        response_tags.assert_called_once()
+        assert writes.count(LLMOBS_APM_SHADOW_INPUT_TOKENS_METRIC_KEY) == 1
+        if enabled:
+            assert_llmobs_span_data(
+                _get_llmobs_data_metastruct(span),
+                span_kind="llm",
+                model_name="claude-3-opus-20240229",
+                input_messages=[{"role": "user", "content": "Hi"}],
+                output_messages=[{"role": "assistant", "content": "Hello"}],
+            )
+
+    with anthropic_module.Anthropic(
+        api_key="not-a-real-key", http_client=httpx.Client(transport=httpx.MockTransport(respond))
+    ) as client:
+        if patch_before_enable:
+            patch_anthropic()
+            request(False)
+        subscriber_lifecycle()
+        if not patch_before_enable:
+            patch_anthropic()
+        integration = integration_for("anthropic")
+        assert integration.llmobs_enabled
+        request(True)
+        LLMObs.disable()
+        assert not integration.llmobs_enabled
+        request(False)
+        subscriber_lifecycle()
+        assert integration_for("anthropic") is integration
+        assert integration.llmobs_enabled
+        request(True)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_subscriber_real_unpatch_inflight(subscriber_lifecycle, test_spans, request_vcr, streaming):
+    subscriber_lifecycle()
+    patch_anthropic()
+    integration = integration_for("anthropic")
+
+    # Unpatch while the real SDK request is in progress, before response extraction.
+    def unpatch_during_request(request):
+        unpatch_anthropic()
+        assert integration_for("anthropic") is None
+
+    with anthropic_module.Anthropic(
+        api_key="not-a-real-key", http_client=httpx.Client(event_hooks={"request": [unpatch_during_request]})
+    ) as client:
+        cassette = "anthropic_completion_stream.yaml" if streaming else "anthropic_completion.yaml"
+        with request_vcr.use_cassette(cassette):
+            response = client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=15,
+                messages=[{"role": "user", "content": "Hi"}],
+                stream=streaming,
+            )
+            if streaming:
+                assert not test_spans.pop_traces()
+                list(response)
+    spans = [span for trace in test_spans.pop_traces() for span in trace]
+    assert len(spans) == 1
+    assert spans[0].finished
+    assert spans[0].get_metric(LLMOBS_APM_SHADOW_INPUT_TOKENS_METRIC_KEY) > 0
+    assert_llmobs_span_data(_get_llmobs_data_metastruct(spans[0]), span_kind="llm")
+    assert integration.llmobs_enabled
+
+
+def test_product_start_restores_bundle_with_real_enable(subscriber_lifecycle):
+    subscriber_lifecycle()
+    patch_anthropic()
+    LLMObs.disable()
+    LLMObsLlmSubscriber.unregister()
+    assert not core.has_listeners("span.finishing.llm.request")
+    # Keep the normal product enablement path and limit automatic patching to this integration.
+    modules = ",".join(
+        f"{name}:false"
+        for name in list(SUPPORTED_LLMOBS_INTEGRATIONS.values()) + list(_INTEGRATIONS_W_PROPAGATION_SUPPORT.values())
+    )
+    # The product manager only calls start() when LLMObs is enabled, and disable() above turned it off.
+    with (
+        patch.dict("os.environ", {"DD_PATCH_MODULES": modules + ",anthropic:true"}),
+        override_global_config({"_llmobs_enabled": True}),
+    ):
+        _product.start()
+    assert LLMObs.enabled
+    assert core.has_listeners("span.finishing.llm.request")
+    assert integration_for("anthropic").llmobs_enabled

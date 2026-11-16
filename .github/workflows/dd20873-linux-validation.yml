@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CANDIDATE_SHA: 482b189a65a6ca24ab215199f1e8ae78ff5f7dfe
+  CANDIDATE_SHA: ea97b4a0eedbeb3f90f4227920a8d9dd4250bcfc
   BASELINE_SHA: e09f13e259789da82b1c17fae3866c67bedcdd8c
   MAIN_SHA: 14b932594537dc40c50b791bd55532667941dc33
 
@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: inchang-ing/dd-trace-py
-          ref: 482b189a65a6ca24ab215199f1e8ae78ff5f7dfe
+          ref: ea97b4a0eedbeb3f90f4227920a8d9dd4250bcfc
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -139,7 +139,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: inchang-ing/dd-trace-py
-          ref: 482b189a65a6ca24ab215199f1e8ae78ff5f7dfe
+          ref: ea97b4a0eedbeb3f90f4227920a8d9dd4250bcfc
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

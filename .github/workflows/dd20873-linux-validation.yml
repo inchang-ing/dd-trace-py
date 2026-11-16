@@ -1,0 +1,176 @@
+name: dd20873 isolated Linux validation
+
+on:
+  push:
+    branches: [codex/dd20873-linux-validation-20261116]
+    paths: [.github/workflows/dd20873-linux-validation.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dd20873-linux-validation
+  cancel-in-progress: false
+
+env:
+  CANDIDATE_SHA: 482b189a65a6ca24ab215199f1e8ae78ff5f7dfe
+  BASELINE_SHA: e09f13e259789da82b1c17fae3866c67bedcdd8c
+  MAIN_SHA: 14b932594537dc40c50b791bd55532667941dc33
+
+jobs:
+  regression:
+    if: github.repository == 'inchang-ing/dd-trace-py'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: oldest-locked
+            version: 0.28.1
+          - sdk: newer-locked
+            version: 0.117.0
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: inchang-ing/dd-trace-py
+          ref: 482b189a65a6ca24ab215199f1e8ae78ff5f7dfe
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout exact baseline
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: inchang-ing/dd-trace-py
+          ref: e09f13e259789da82b1c17fae3866c67bedcdd8c
+          path: baseline
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          version: '0.10.4'
+      - name: Verify source identity and discover official environments
+        env:
+          SDK_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dd20873-evidence"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C candidate rev-parse HEAD:tests/contrib/anthropic/test_anthropic_llmobs.py)" = "$(git -C baseline rev-parse HEAD:tests/contrib/anthropic/test_anthropic_llmobs.py)"
+          test "$(git -C baseline rev-parse HEAD:ddtrace/contrib/internal/anthropic/_streaming.py)" = "$(git -C baseline rev-parse "$MAIN_SHA:ddtrace/contrib/internal/anthropic/_streaming.py")"
+          for phase in baseline candidate; do
+            (cd "$phase" && scripts/run-tests --list ddtrace/contrib/internal/anthropic/_streaming.py tests/contrib/anthropic/test_anthropic_llmobs.py) > "$RUNNER_TEMP/dd20873-evidence/$phase-environments.json"
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'dd20873-evidence'
+          selected = []
+          for phase in ('baseline', 'candidate'):
+              data = json.loads((root / f'{phase}-environments.json').read_text())
+              rows = [v for s in data['suites'] if s['name'] == 'llmobs::anthropic' for v in s['venvs'] if v['python_version'] == '3.12']
+              rows = [v for v in rows if f"anthropic=={os.environ['SDK_VERSION']}\n" in (Path(phase) / 'tests/requirements_locks' / f"{v['hash']}.txt").read_text()]
+              assert len(rows) == 1, rows
+              selected.append(rows[0]['hash'])
+          assert selected[0] == selected[1], selected
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'ENVIRONMENT_HASH={selected[0]}\n')
+          (root / 'selection.json').write_text(json.dumps({'python': '3.12', 'sdk': os.environ['SDK_VERSION'], 'hash': selected[0]}, indent=2))
+          PY
+      - name: Real baseline failure, exact-candidate pass and affected suite
+        env:
+          SDK_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/dd20873-evidence"
+          docker version > "$evidence/docker.txt"
+          for phase in baseline candidate; do
+            cd "$GITHUB_WORKSPACE/$phase"
+            mkdir -p .cache/dd20873-evidence
+            git show -s --format=fuller HEAD > "$evidence/$phase-commit.txt"
+            sha256sum "tests/requirements_locks/$ENVIRONMENT_HASH.txt" > "$evidence/$phase-lock.sha256"
+            set +e
+            scripts/run-tests -r --venv "$ENVIRONMENT_HASH" -- -vv -k streamed_cache_creation_ttl_breakdown --junitxml=.cache/dd20873-evidence/regression.xml 2>&1 | tee "$evidence/$phase-regression.log"
+            regression_exit=${PIPESTATUS[0]}
+            set -e
+            echo "$regression_exit" > "$evidence/$phase-exit-code.txt"
+            cp .cache/dd20873-evidence/regression.xml "$evidence/$phase-regression.xml"
+            scripts/ddtest env DD_TRACE_ENABLED=false DD_INSTRUMENTATION_TELEMETRY_ENABLED=false ".cache/test-environments/$ENVIRONMENT_HASH/bin/python" -c 'import anthropic,ddtrace,hashlib,json,pathlib,sys; import ddtrace.contrib.internal.anthropic._streaming as stream; import ddtrace.llmobs._integrations.anthropic as integration; root=pathlib.Path("/home/bits/project"); modules={"ddtrace":ddtrace,"streaming":stream,"integration":integration}; print(json.dumps({"python":sys.version,"sdk":anthropic.__version__,"sdk_file":anthropic.__file__,"source_imports":{k:m.__file__ for k,m in modules.items()}},indent=2)); assert anthropic.__version__==sys.argv[1]; assert all(pathlib.Path(m.__file__).resolve().is_relative_to(root) for m in modules.values()); assert all(hashlib.sha256(pathlib.Path(m.__file__).read_bytes()).digest()==hashlib.sha256((root/p).read_bytes()).digest() for p,m in [("ddtrace/contrib/internal/anthropic/_streaming.py",stream),("ddtrace/llmobs/_integrations/anthropic.py",integration)])' "$SDK_VERSION" > "$evidence/$phase-source-imports.log" 2>&1
+            PHASE="$phase" REGRESSION_EXIT="$regression_exit" python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          phase = os.environ['PHASE']
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'dd20873-evidence'
+          cases = list(ET.parse(evidence / f'{phase}-regression.xml').iter('testcase'))
+          assert len(cases) == 8, f'{phase}: expected 8 collected cases, got {len(cases)}'
+          assert all(c.get('name', '').startswith('test_streamed_cache_creation_ttl_breakdown[') for c in cases)
+          assert not any(c.find('error') is not None or c.find('skipped') is not None for c in cases)
+          failures = [c.find('failure') for c in cases if c.find('failure') is not None]
+          if phase == 'baseline':
+              assert os.environ['REGRESSION_EXIT'] == '1' and len(failures) == 4, 'Baseline must have four TTL assertion failures, not setup errors'
+              assert all('ephemeral_1h_input_tokens' in (f.text or '') for f in failures), 'Unexpected baseline failure signature'
+          else:
+              assert os.environ['REGRESSION_EXIT'] == '0' and not failures, 'Candidate regression did not pass'
+          PY
+          done
+          cd "$GITHUB_WORKSPACE/candidate"
+          scripts/run-tests --venv "$ENVIRONMENT_HASH" -- -vv --cov=ddtrace.contrib.internal.anthropic._streaming --cov-branch --cov-report=term-missing --junitxml=.cache/dd20873-evidence/affected.xml 2>&1 | tee "$evidence/candidate-affected-suite.log"
+          cp .cache/dd20873-evidence/affected.xml "$evidence/candidate-affected-suite.xml"
+          git diff --exit-code > "$evidence/candidate-tracked-diff.log"
+      - name: Upload evidence even after a failure
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: dd20873-${{ matrix.sdk }}
+          path: ${{ runner.temp }}/dd20873-evidence
+          retention-days: 7
+
+  checks:
+    if: github.repository == 'inchang-ing/dd-trace-py'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: inchang-ing/dd-trace-py
+          ref: 482b189a65a6ca24ab215199f1e8ae78ff5f7dfe
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          version: '0.10.4'
+      - name: Official Linux lint and release-note checks
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/dd20873-evidence"
+          mkdir -p "$evidence"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git update-ref refs/remotes/origin/main "$MAIN_SHA"
+          git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+          set +e
+          scripts/lint checks 2>&1 | tee "$evidence/lint-checks.log"
+          lint_exit=${PIPESTATUS[0]}
+          env -u GITHUB_EVENT_PATH scripts/check-releasenotes 2>&1 | tee "$evidence/check-releasenotes.log"
+          note_exit=${PIPESTATUS[0]}
+          uvx --from 'reno==4.1.0' reno lint 2>&1 | tee "$evidence/reno-lint.log"
+          reno_exit=${PIPESTATUS[0]}
+          set -e
+          printf 'lint=%s\nnote=%s\nreno=%s\n' "$lint_exit" "$note_exit" "$reno_exit" > "$evidence/check-exit-codes.txt"
+          git diff --exit-code > "$evidence/candidate-tracked-diff.log"
+          test "$lint_exit" = 0 && test "$note_exit" = 0 && test "$reno_exit" = 0
+      - name: Upload check evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: dd20873-linux-checks
+          path: ${{ runner.temp }}/dd20873-evidence
+          retention-days: 7
